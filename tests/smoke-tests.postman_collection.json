@@ -1,0 +1,47 @@
+{
+  "info": {
+    "name": "Smoke Tests",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3001" }
+  ],
+  "item": [
+    {
+      "name": "Backend alive - GET rooms",
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('status 200', () => pm.response.to.have.status(200));",
+        "pm.test('is array', () => pm.expect(pm.response.json()).to.be.an('array'));",
+        "pm.test('response < 5s', () => pm.expect(pm.response.responseTime).to.be.below(5000));"
+      ] } }],
+      "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/rooms" }
+    },
+    {
+      "name": "Security headers present",
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('X-Content-Type-Options', () => pm.response.to.have.header('X-Content-Type-Options'));",
+        "pm.test('no X-Powered-By', () => pm.expect(pm.response.headers.has('X-Powered-By')).to.be.false);"
+      ] } }],
+      "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/rooms" }
+    },
+    {
+      "name": "Protected route blocked",
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('blocked 401/403', () => pm.expect([401, 403]).to.include(pm.response.code));"
+      ] } }],
+      "request": { "method": "GET", "header": [], "url": "{{baseUrl}}/api/reports" }
+    },
+    {
+      "name": "Login rejects bad credentials",
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('rejected 400/401', () => pm.expect([400, 401]).to.include(pm.response.code));"
+      ] } }],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\"username\":\"smoke-test\",\"password\":\"not-a-real-password\"}" },
+        "url": "{{baseUrl}}/api/login"
+      }
+    }
+  ]
+}
