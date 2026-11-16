@@ -2,21 +2,23 @@ name: CI/CD Pipeline — Booking App
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+# ยกเลิก run เก่าของ branch เดียวกันเมื่อมี push ใหม่
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
-  NODE_VERSION: '20'
+  NODE_VERSION: "20"
 
 jobs:
-  # ─────────────────────────────────────────────
-  # Job 1: Backend CI — Install, Migrate, Test
-  # ─────────────────────────────────────────────
+  # ───────────── 1) Backend: migrate + Newman API tests ─────────────
   backend-test:
     name: Backend Tests (Newman API)
     runs-on: ubuntu-latest
-
     services:
       postgres:
         image: postgres:16-alpine
@@ -31,187 +33,221 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/booking_test
+      JWT_SECRET: ci-test-secret-key
+      PORT: 3001
+      NODE_ENV: test
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
+          cache: npm
           cache-dependency-path: backend/package-lock.json
 
       - name: Install backend dependencies
-        run: |
-          cd backend
-          npm ci
+        working-directory: backend
+        run: npm ci
 
       - name: Generate Prisma client
-        run: |
-          cd backend
-          npx prisma generate --schema=prisma/schema.prisma
+        working-directory: backend
+        run: npx prisma generate --schema=prisma/schema.prisma
 
       - name: Run database migrations
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/booking_test
-        run: |
-          cd backend
-          npx prisma migrate deploy --schema=prisma/schema.prisma
+        working-directory: backend
+        run: npx prisma migrate deploy --schema=prisma/schema.prisma
 
-      - name: Seed test data
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/booking_test
-          JWT_SECRET: ci-test-secret-key
-          NODE_ENV: test
-        run: |
-          cd backend
-          # รัน seed script ถ้ามี (สร้าง admin user สำหรับ test)
-          node -e "
-            const { PrismaClient } = require('@prisma/client');
-            const bcrypt = require('bcryptjs');
-            const prisma = new PrismaClient();
-            async function seed() {
-              const hash = await bcrypt.hash('admin123', 10);
-              await prisma.user.upsert({
-                where: { username: 'admin' },
-                update: {},
-                create: { username: 'admin', password: hash, role: 'admin' }
-              });
-              await prisma.room.create({
-                data: { name: 'Test Room 101', roomType: 'Standard', capacity: 2, price: 1000 }
-              });
-              console.log('Seed completed');
-            }
-            seed().catch(console.error).finally(() => prisma.\$disconnect());
-          "
-
+      # ไม่ต้อง seed แยก: database.js สร้าง admin และห้อง 3 ประเภทให้เองตอน server เริ่มทำงาน
       - name: Start backend server
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/booking_test
-          JWT_SECRET: ci-test-secret-key
-          PORT: 3001
-          NODE_ENV: test
+        working-directory: backend
         run: |
-          cd backend
-          npm start &
-          # รอให้ server พร้อม
-          sleep 5
-          curl -f http://localhost:3001/api/rooms || (echo "Server not ready" && exit 1)
+          nohup npm start > ../server.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3001/api/rooms > /dev/null; then
+              echo "Server is ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Server did not start"; cat ../server.log; exit 1
 
       - name: Install Newman
         run: npm install -g newman newman-reporter-htmlextra
 
-      - name: Run Newman API Tests
+      - name: Run Newman — booking API tests
         run: |
+          mkdir -p newman-reports
           newman run tests/booking-api.postman_collection.json \
             --env-var "baseUrl=http://localhost:3001" \
-            --reporters cli,junit \
-            --reporter-junit-export newman-results.xml
+            -r cli,htmlextra,junit \
+            --reporter-htmlextra-export newman-reports/booking-api.html \
+            --reporter-junit-export newman-reports/booking-api.xml
 
-      - name: Upload Newman test results
-        uses: actions/upload-artifact@v4
+      - name: Run Newman — hotel booking tests
+        run: |
+          newman run newman/hotel-booking-collection.json \
+            -e newman/hotel-booking-env.json \
+            --env-var "baseUrl=http://localhost:3001" \
+            -r cli,htmlextra,junit \
+            --reporter-htmlextra-export newman-reports/hotel-booking.html \
+            --reporter-junit-export newman-reports/hotel-booking.xml
+
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: newman-test-results
-          path: newman-results.xml
+          name: newman-reports
+          path: newman-reports/
 
-  # ─────────────────────────────────────────────
-  # Job 2: Frontend CI — Install, Build, Lint
-  # ─────────────────────────────────────────────
+      - name: Show server log on failure
+        if: failure()
+        run: cat server.log
+
+  # ───────────── 2) Frontend build ─────────────
   frontend-build:
-    name: Frontend Build & Lint
+    name: Frontend Build
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
+          cache: npm
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install frontend dependencies
-        run: |
-          cd frontend
-          npm ci
+        working-directory: frontend
+        run: npm ci
 
       - name: Build frontend
+        working-directory: frontend
         env:
           VITE_API_URL: http://localhost:3001
-        run: |
-          cd frontend
-          npm run build
+        run: npm run build
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: frontend-build
           path: frontend/dist/
 
-  # ─────────────────────────────────────────────
-  # Job 3: Deploy Frontend to Vercel
-  # (เฉพาะเมื่อ push ไปที่ main เท่านั้น)
-  # ─────────────────────────────────────────────
+  # ───────────── 3) Security scan ─────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [backend-test, frontend-build]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: npm audit — backend (High+)
+        working-directory: backend
+        run: npm ci && npm audit --audit-level=high
+
+      - name: npm audit — frontend (High+)
+        working-directory: frontend
+        run: npm ci && npm audit --audit-level=high
+
+      - name: TruffleHog — secret scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          extra_args: --only-verified
+
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        continue-on-error: true
+        with:
+          project: booking-app
+          path: .
+          format: HTML
+          out: owasp-report
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: owasp-report
+          path: owasp-report/
+
+  # ───────────── 4) Deploy (main เท่านั้น) ─────────────
   deploy-frontend:
     name: Deploy Frontend → Vercel
     runs-on: ubuntu-latest
-    needs: [backend-test, frontend-build]
+    needs: [security-scan]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # รันจาก root ของ repo เพราะตั้ง Root Directory = frontend ไว้ในโปรเจกต์ Vercel แล้ว
+      - run: npm install -g vercel
+      - run: vercel pull --yes --environment=production --token "$VERCEL_TOKEN"
+      - run: vercel build --prod --token "$VERCEL_TOKEN"
+      - run: vercel deploy --prebuilt --prod --token "$VERCEL_TOKEN"
 
-      - name: Install Vercel CLI
-        run: npm install -g vercel
-
-      - name: Deploy to Vercel (Production)
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-        run: |
-          cd frontend
-          vercel --prod \
-            --token $VERCEL_TOKEN \
-            --yes
-
-  # ─────────────────────────────────────────────
-  # Job 4: Deploy Backend to Render
-  # (เฉพาะเมื่อ push ไปที่ main เท่านั้น)
-  # ─────────────────────────────────────────────
   deploy-backend-render:
     name: Deploy Backend → Render
     runs-on: ubuntu-latest
-    needs: [backend-test, frontend-build]
+    needs: [security-scan]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
     steps:
-      - name: Trigger Render Deployment
-        run: |
-          curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+      - name: Trigger Render deploy hook
+        run: curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
 
-      - name: Wait for Render deployment (180s)
-        run: sleep 180
-
-      - name: Health check — Backend on Render
+      - name: Wait until backend is healthy
         run: |
-          TIMEOUT=300
-          INTERVAL=10
-          ELAPSED=0
+          TIMEOUT=600; INTERVAL=15; ELAPSED=0
           while [ $ELAPSED -lt $TIMEOUT ]; do
-            echo "Health check attempt... (${ELAPSED}/${TIMEOUT}s)"
-            if curl -f --connect-timeout 5 --max-time 10 "${{ secrets.RENDER_BACKEND_URL }}/api/rooms" > /dev/null 2>&1; then
-              echo "✅ Render deployment successful!"
-              exit 0
+            echo "Health check... (${ELAPSED}/${TIMEOUT}s)"
+            if curl -f --connect-timeout 5 --max-time 15 "${{ secrets.RENDER_BACKEND_URL }}/api/rooms" > /dev/null 2>&1; then
+              echo "Render deployment is healthy"; exit 0
             fi
             sleep $INTERVAL
             ELAPSED=$((ELAPSED + INTERVAL))
           done
-          echo "❌ Render health check failed after ${TIMEOUT}s"
-          exit 1
+          echo "Render health check failed after ${TIMEOUT}s"; exit 1
 
+  # ───────────── 5) Post-deployment smoke test ─────────────
+  post-deploy-smoke-test:
+    name: Post-Deploy Smoke Test
+    runs-on: ubuntu-latest
+    needs: [deploy-frontend, deploy-backend-render]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    env:
+      BACKEND: ${{ secrets.RENDER_BACKEND_URL }}
+      FRONTEND: ${{ secrets.VERCEL_FRONTEND_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
+      - name: Newman smoke tests on production
+        run: |
+          npm install -g newman
+          newman run tests/smoke-tests.postman_collection.json \
+            --env-var "baseUrl=$BACKEND"
+
+      - name: Check security headers
+        run: |
+          headers=$(curl -sI "$BACKEND/api/rooms")
+          echo "$headers"
+          for h in x-content-type-options x-frame-options strict-transport-security; do
+            echo "$headers" | grep -qi "^$h:" || { echo "Missing header: $h"; exit 1; }
+          done
+
+      - name: Frontend reachable
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" "$FRONTEND")
+          echo "Frontend HTTP $code"
+          [ "$code" = "200" ]
